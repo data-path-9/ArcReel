@@ -18,6 +18,7 @@ from pydantic import BaseModel, ValidationError
 from pydantic_core import ErrorDetails
 
 from lib.data_validator import ValidationResult
+from lib.script_editor import resolve_kind
 from lib.script_models import (
     DramaEpisodeScript,
     NarrationEpisodeScript,
@@ -33,25 +34,23 @@ class ScriptStructureValidationError(ValueError):
         super().__init__("; ".join(result.errors) or "script structure invalid")
 
 
-def _select_model(script: dict[str, Any]) -> type[BaseModel]:
-    """按 generation_mode / content_mode / 顶层键判别该用哪个剧本模型。
+_KIND_MODEL: dict[str, type[BaseModel]] = {
+    "video_units": ReferenceVideoScript,
+    "scenes": DramaEpisodeScript,
+    "segments": NarrationEpisodeScript,
+}
 
-    reference 分支最优先：generation_mode == "reference_video"（或存在 video_units）压过
-    content_mode，即使 content_mode == "narration" 也走 ReferenceVideoScript。其余以
-    content_mode 为权威：drama → Drama、narration → Narration；content_mode 缺省时才按顶层键
-    存在性（而非列表真值）推断。用 "scenes" in script 而非 script.get("scenes") 真值，否则
-    空场景 drama（{"content_mode": "drama", "scenes": []}，结构合法）会被误判到 Narration 拒写。
+
+def _select_model(script: dict[str, Any]) -> type[BaseModel]:
+    """按模式判别该用哪个剧本模型，判别逻辑收归 `script_editor.resolve_kind`（单一真相源，
+    与编辑核心、写盘统一入口的 metadata 重算共用，不漂移）。
+
+    判别**数据形状优先**(详见 `resolve_kind` docstring):video_units 唯一存在时才路由
+    reference,否则按 content_mode → segments/scenes(空场景 drama 仍走 DramaEpisodeScript)。
+    ``generation_mode`` 不参与判别——caller 端的生成路径(enqueue_videos 等)自己按
+    generation_mode 分流;此函数只决定**结构校验**用哪个 Pydantic 模型。
     """
-    if script.get("generation_mode") == "reference_video" or "video_units" in script:
-        return ReferenceVideoScript
-    content_mode = script.get("content_mode")
-    if content_mode == "drama":
-        return DramaEpisodeScript
-    if content_mode == "narration":
-        return NarrationEpisodeScript
-    if "scenes" in script and "segments" not in script:
-        return DramaEpisodeScript
-    return NarrationEpisodeScript
+    return _KIND_MODEL[resolve_kind(script)]
 
 
 def _format_error(err: ErrorDetails) -> str:

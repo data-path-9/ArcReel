@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from lib.script_generator import ScriptGenerator
+from lib.script_structure_validator import ScriptStructureValidationError
 
 
 def _write(path: Path, text: str):
@@ -30,7 +31,6 @@ def _valid_narration_response() -> dict:
                 "segment_break": False,
                 "novel_text": "原文",
                 "characters_in_segment": ["姜月茴"],
-                "clues_in_segment": ["玉佩"],
                 "image_prompt": {
                     "scene": "场景",
                     "composition": {
@@ -229,8 +229,10 @@ class TestScriptGenerator:
 
         fake = _FakeTextGenerator(json.dumps({"foo": "bar"}))
         generator = ScriptGenerator(project_path, generator=fake)
-        # generate 会因验证失败但 schema 已传入，检查传入的 schema 是否为类
-        await generator.generate(1)
+        # 结构非法的响应在写盘统一入口被严格校验拒绝；但模型调用已发生，
+        # 仍可断言传入的 schema 是 Pydantic 类。
+        with pytest.raises(ScriptStructureValidationError):
+            await generator.generate(1)
         assert fake.backend.last_request.response_schema is DramaEpisodeScript
 
     async def test_generate_sets_script_max_output_tokens(self, tmp_path):
@@ -255,7 +257,8 @@ class TestScriptGenerator:
 
         fake = _FakeTextGenerator(json.dumps({"foo": "bar"}))
         generator = ScriptGenerator(project_path, generator=fake)
-        await generator.generate(1)
+        with pytest.raises(ScriptStructureValidationError):
+            await generator.generate(1)
 
         assert fake.backend.last_request.max_output_tokens == SCRIPT_MAX_OUTPUT_TOKENS
         assert SCRIPT_MAX_OUTPUT_TOKENS >= 16000
@@ -269,6 +272,29 @@ class TestScriptGenerator:
         generator = ScriptGenerator(project_path)  # 无 backend
         with pytest.raises(RuntimeError, match="TextGenerator 未初始化"):
             await generator.generate(1)
+
+    @pytest.mark.parametrize(
+        "bad_filename",
+        [
+            "subdir/episode_1.json",  # 子目录
+            "../etc/passwd",  # path traversal
+            "/tmp/abs.json",  # 绝对路径
+            "a\\b.json",  # Windows 分隔符
+            "",  # 空字符串:Path("").name == "" 会过前两条校验,带空 filename 到写盘才崩
+        ],
+    )
+    async def test_generate_rejects_non_basename_output_filename(self, tmp_path, bad_filename):
+        """generate(output_filename=...) 的公开契约「只决定文件名,不接受目录」必须在入口兑现:
+        save_script 咽喉的 _safe_subpath 能挡绝对路径与 path traversal,但子目录拼出的 realpath
+        仍在 scripts/ 内,不挡;故公开 API 这层必须显式拒,让 docstring 不骗人。
+        """
+        project_path = tmp_path / "demo"
+        _write_json(project_path / "project.json", {"title": "项目"})
+
+        fake = _FakeTextGenerator(json.dumps(_valid_narration_response(), ensure_ascii=False))
+        generator = ScriptGenerator(project_path, generator=fake)
+        with pytest.raises(ValueError, match="只接受纯文件名"):
+            await generator.generate(1, output_filename=bad_filename)
 
 
 class TestAddMetadataRewritesEpisodePrefix:

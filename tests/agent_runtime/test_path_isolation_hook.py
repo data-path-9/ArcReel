@@ -63,6 +63,124 @@ def test_write_cwd_internal_data_ext_allowed(sm: SessionManager) -> None:
         assert allowed, f"扩展名 {ext} 应允许"
 
 
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+@pytest.mark.parametrize("relative", ["scripts/episode_1.json", "scripts/episode_10.json", "project.json"])
+def test_write_protected_project_json_denied(sm: SessionManager, tool: str, relative: str) -> None:
+    """scripts/*.json 与 project.json 不可用 Write/Edit 直改，报错指向 MCP 工具。"""
+    cwd = sm.project_root / "projects" / "selfproj"
+    allowed, reason = sm._is_path_allowed(str(cwd / relative), tool, cwd)
+    assert not allowed, f"{tool} {relative} 应被拒"
+    assert reason and "patch_episode_script" in reason or "patch_project" in (reason or "")
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+def test_write_protected_scripts_dir_itself_denied(sm: SessionManager, tool: str) -> None:
+    """`scripts/` 目录路径本身（不带 trailing sep）也该拒：defense-in-depth，
+    不依赖 OS 兜底 agent 把目录名当文件路径的 typo。"""
+    cwd = sm.project_root / "projects" / "selfproj"
+    allowed, reason = sm._is_path_allowed(str(cwd / "scripts"), tool, cwd)
+    assert not allowed
+    assert reason and ("patch_episode_script" in reason or "patch_project" in reason)
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+@pytest.mark.parametrize(
+    "relative",
+    ["scripts/episode_1.bak", "scripts/notes.md", "scripts/.tmp", "scripts/subdir/anything.txt"],
+)
+def test_write_protected_scripts_non_json_denied(sm: SessionManager, tool: str, relative: str) -> None:
+    """`scripts/` 下任意文件类型都该拒（不只 .json）：sandbox denyWrite 把整个 scripts/ 列入
+    内核级 deny，hook 层须保持一致，避免 agent 用 Write 污染剧本目录。"""
+    cwd = sm.project_root / "projects" / "selfproj"
+    allowed, reason = sm._is_path_allowed(str(cwd / relative), tool, cwd)
+    assert not allowed, f"{tool} {relative} 应被拒"
+    assert reason and ("patch_episode_script" in reason or "patch_project" in reason)
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+@pytest.mark.parametrize(
+    "relative",
+    ["PROJECT.JSON", "Project.Json", "scripts/EPISODE_1.JSON", "Scripts/episode_1.json"],
+)
+def test_write_protected_case_variants_denied(sm: SessionManager, tool: str, relative: str) -> None:
+    """大小写变体（PROJECT.JSON / Scripts/x.json）在 Windows NTFS / macOS APFS 默认卷
+    上指向同一物理文件，Path 字符串比较 case-sensitive 会漏判——`_is_protected_project_json`
+    用 casefold 比较后这类变体也应被拒，否则 agent 可改大小写绕过收口。"""
+    cwd = sm.project_root / "projects" / "selfproj"
+    allowed, reason = sm._is_path_allowed(str(cwd / relative), tool, cwd)
+    assert not allowed, f"{tool} {relative} 应被拒"
+    assert reason and ("patch_episode_script" in reason or "patch_project" in reason)
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+def test_write_protected_via_symlink_project_json_denied(sm: SessionManager, tool: str) -> None:
+    """`project.json` 本身被做成项目内 symlink（指向另一个项目内文件）时，仍须拒——
+    防止"把入口换成 symlink"绕过 protected 区判定。仅靠 resolve 后路径比较会失配。"""
+    cwd = sm.project_root / "projects" / "selfproj"
+    real = cwd / "other.json"
+    real.write_text("{}", encoding="utf-8")
+    link = cwd / "project.json"
+    link.symlink_to(real)
+    allowed, reason = sm._is_path_allowed(str(link), tool, cwd)
+    assert not allowed, "symlink 形态的 project.json 写入应被拒"
+    assert reason and ("patch_project" in reason or "patch_episode_script" in reason)
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+def test_write_protected_via_symlink_scripts_dir_denied(sm: SessionManager, tool: str) -> None:
+    """`scripts/` 整个目录被做成项目内 symlink 时，对其下 .json 的写入仍须拒。"""
+    cwd = sm.project_root / "projects" / "selfproj"
+    real_dir = cwd / "data"
+    real_dir.mkdir()
+    link_dir = cwd / "scripts"
+    link_dir.symlink_to(real_dir)
+    target = link_dir / "episode_1.json"
+    allowed, reason = sm._is_path_allowed(str(target), tool, cwd)
+    assert not allowed, "symlink 形态的 scripts/ 下 .json 写入应被拒"
+    assert reason and ("patch_episode_script" in reason or "patch_project" in reason)
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+def test_write_protected_with_symlinked_project_cwd_denied(sm: SessionManager, tmp_path: Path, tool: str) -> None:
+    """project_cwd 本身是个 symlink 指向真实项目目录时(macOS /var↔/private/var、Linux
+    symlinked 项目根),`_is_protected_project_json` 要把 base 也按 resolve 一次再拼接 protected
+    路径,避免 resolved target 与 raw base 字符串不等 → bypass。"""
+    # 真实项目目录在 tmp 根的另一处,通过 symlink 暴露
+    real_root = tmp_path / "real_data"
+    (real_root / "projects" / "selfproj").mkdir(parents=True)
+    link_cwd = sm.project_root / "projects" / "selfproj_link"
+    link_cwd.symlink_to(real_root / "projects" / "selfproj")
+
+    # caller 把 symlinked cwd 传入,_is_path_allowed 内 logical.resolve() 会展开 symlink,
+    # 然后 _check_write_access 把 resolved target 与原始 link_cwd 比较——若不把 base 也
+    # resolve,就会因为字符串不等漏判。
+    allowed, reason = sm._is_path_allowed(str(link_cwd / "project.json"), tool, link_cwd)
+    assert not allowed, "symlinked project_cwd 下 project.json 写入应被拒"
+    assert reason and ("patch_project" in reason or "patch_episode_script" in reason)
+
+    allowed, reason = sm._is_path_allowed(str(link_cwd / "scripts" / "episode_1.json"), tool, link_cwd)
+    assert not allowed, "symlinked project_cwd 下 scripts/*.json 写入应被拒"
+    assert reason and ("patch_episode_script" in reason or "patch_project" in reason)
+
+
+def test_write_drafts_and_source_still_allowed(sm: SessionManager) -> None:
+    """合法的草稿/源文件写入不受影响（drafts/*.md、source/*.txt、scripts 外的 .json）。"""
+    cwd = sm.project_root / "projects" / "selfproj"
+    for relative in ("drafts/episode_1/step1_segments.md", "source/episode_1.txt", "config_data.json"):
+        allowed, _ = sm._is_path_allowed(str(cwd / relative), "Write", cwd)
+        assert allowed, f"{relative} 应允许"
+
+
+def test_build_sandbox_settings_denies_write_to_project_json(sm: SessionManager) -> None:
+    """sandbox 启用时 denyWrite 覆盖 scripts/ 与 project.json（Bash 子进程内核级封堵）。"""
+    sm._sandbox_enabled = True
+    cwd = sm.project_root / "projects" / "selfproj"
+    settings = sm._build_sandbox_settings(cwd)
+    deny_write = settings["filesystem"]["denyWrite"]
+    assert str(cwd / "scripts") in deny_write
+    assert str(cwd / "project.json") in deny_write
+
+
 @pytest.mark.parametrize(
     "relative",
     [

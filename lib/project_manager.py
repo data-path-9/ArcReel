@@ -36,7 +36,7 @@ from lib.profile_manifest import (
     force_resync_profile as _force_resync_profile,
 )
 from lib.project_change_hints import emit_project_change_hint
-from lib.script_models import SCRIPT_SHAPES, ScriptShape
+from lib.script_editor import ScriptEditError, resolve_items
 from lib.style_templates import LEGACY_STYLE_MAP, resolve_template_prompt
 
 logger = logging.getLogger(__name__)
@@ -69,17 +69,26 @@ def effective_mode(*, project: dict, episode: dict) -> str:
     return _DEFAULT_GENERATION_MODE
 
 
-def _script_items_shape(script: dict, content_mode: str) -> ScriptShape:
-    """选剧本列表所在的形状（字段名取自 lib.script_models.SCRIPT_SHAPES）。
+def _resolve_items_or_warn(script: dict, *, script_filename: str | None = None) -> list[dict]:
+    """读取路径的脏数据降级：基于 `resolve_items` 三模式判别（narration/drama/reference_video），
+    脏数据（键存在但值非 list）下 log warning + 返回 []。
 
-    仅当 content_mode=narration **且**脚本确有 narration 列表键时走 narration 形状；
-    否则落 drama 形状——这覆盖了 narration 但数据畸形落在 `scenes` 键下的回退，保持
-    与历史 `if content_mode == "narration" and "segments" in script` 守卫一致。
+    与写入路径（`update_scene_asset` / `batch_update_scene_assets`）共用 `resolve_items` 判别
+    保证三模式一致——上一版本用 `_script_items_shape` 在 reference 模式下会静默落到 drama
+    兜底返回 []，破坏一致性。写入侧应该 fail-loud（让 ScriptEditError 上冒，worker 显式失败，
+    上层 API 5xx 告知数据损坏）；读取侧在脏数据下返回 [] 不阻塞 UI 渲染，但 warning 给运维
+    可观测信号去人工修复，不让降级变隐形。
     """
-    narration = SCRIPT_SHAPES["narration"]
-    if content_mode == "narration" and narration.items_key in script:
-        return narration
-    return SCRIPT_SHAPES["drama"]
+    try:
+        items, _id_field, _kind = resolve_items(script)
+        return items
+    except ScriptEditError as e:
+        logger.warning(
+            "剧本 %s 数据损坏（%s），读取降级为空列表——请人工修复",
+            script_filename or "<unknown>",
+            e,
+        )
+        return []
 
 
 class EpisodeScriptReboundError(RuntimeError):
@@ -548,30 +557,41 @@ class ProjectManager:
         metadata.setdefault("status", "draft")
         metadata["updated_at"] = now
 
-        scenes = script.get("scenes", [])
-        if not isinstance(scenes, list):
-            scenes = []
-        segments = script.get("segments", [])
-        if not isinstance(segments, list):
-            segments = []
-
-        content_mode = script.get("content_mode", "narration")
-        if content_mode == "narration" and segments:
-            items = segments
-            items_type = "segments"
-        elif scenes:
-            items = scenes
-            items_type = "scenes"
+        # 选当前剧本的分镜数组：与结构校验 `_select_model` / 编辑核心 `resolve_items` 共用同一
+        # 判别（含 reference 模式的 video_units——否则它会落入 segments 兜底分支、total_scenes 错算为 0）。
+        # `resolve_items` 对 segments/scenes/video_units 存在但非 list（含 null 这类历史脏数据）会
+        # fail-loud：`validate=True` 路径已被 `_guard_no_worse` 提前拦下（不会到这里）；只有
+        # `validate=False` 资产回写热路径才会撞上脏数据键，此时**保留旧 metadata 不重算**——
+        # 旧的 total_scenes / estimated_duration_seconds 即便陈旧，也好过把 reference 模式
+        # 改写成 0-scene narration shell（fallback hard-pin kind='segments' 那种）。资产回写本就
+        # 「整体豁免结构校验」，连带豁免 metadata 重算与「不更坏」语义一致：脏数据不更坏。
+        try:
+            items, _id_field, kind = resolve_items(script)
+        except ScriptEditError as e:
+            logger.warning(
+                "剧本 %s 数据损坏（%s），跳过 metadata 重算以保留旧值",
+                output_path.name,
+                e,
+            )
         else:
-            items = segments
-            items_type = "segments"
+            metadata["total_scenes"] = len(items)
+            # 计算总时长：按当前选中的数据结构决定回退值，避免 content_mode 缺失时误判。
+            # ``.get(k, default)`` 仅在键缺失时返回 default，键存在但值为 None（脏数据）会
+            # 返回 None 让 sum() 抛 TypeError——显式判 None 视为缺失，与同函数前面对 metadata
+            # 缺字段时按 setdefault 兜底的语义一致：脏值不阻塞 metadata 重算，但若 default 也
+            # 失真（如 reference 模式未填 duration_seconds），下游 estimated 字段仍是近似值。
+            default_duration = 4 if kind == "segments" else 8
 
-        metadata["total_scenes"] = len(items)
+            def _duration(item: dict) -> int:
+                value = item.get("duration_seconds")
+                # bool 是 int 子类,排除避免 duration_seconds=True 被算成 1 秒、=False 算成 0 秒
+                if isinstance(value, bool):
+                    return default_duration
+                if isinstance(value, (int, float)):
+                    return int(value)
+                return default_duration
 
-        # 计算总时长：按当前选中的数据结构决定回退值，避免 content_mode 缺失时误判
-        default_duration = 4 if items_type == "segments" else 8
-        total_duration = sum(item.get("duration_seconds", default_duration) for item in items)
-        metadata["estimated_duration_seconds"] = total_duration
+            metadata["estimated_duration_seconds"] = sum(_duration(item) for item in items)
 
         # 原子写（含路径遍历防护，output_path 已在守卫前解析），避免并发 PATCH 导致 JSON 损坏
         atomic_write_json(output_path, script)
@@ -1090,12 +1110,15 @@ class ProjectManager:
             更新后的剧本
         """
         # 资产回写热路径：只动 generated_assets，结构不可能因此变坏，豁免结构校验。
+        # 但「分镜数组键损坏（如 segments: null）」是更严重的损坏，写入侧必须 fail-loud——
+        # 静默 no-op 等于把数据丢失藏起来：worker 写完 N 个 video_clip 还以为成功了，UI 却
+        # 看不到任何回写。让 ScriptEditError 上冒，worker 层负责降级（记 task 失败、人工修复）。
+        # `resolve_items` 三模式判别（narration/drama/reference_video）与 `_write_script_unlocked`
+        # / 读取 helper 共用同一源——避免 `_script_items_shape` 那种 reference 模式落到 drama 兜底
+        # 取 "scenes" 键、静默返回 [] 然后 KeyError 报"场景不存在"的根因被掩盖路径。
         with self.locked_script(project_name, script_filename, validate=False) as script:
-            # 根据内容模式选择正确的数据结构
             content_mode = script.get("content_mode", "narration")
-            shape = _script_items_shape(script, content_mode)
-            items = script.get(shape.items_key, [])
-            id_field = shape.id_field
+            items, id_field, _kind = resolve_items(script)
 
             for item in items:
                 if str(item.get(id_field)) == str(scene_id):
@@ -1139,18 +1162,23 @@ class ProjectManager:
             return {}
 
         # 资产回写热路径：只动 generated_assets，结构不可能因此变坏，豁免结构校验。
+        # 分镜数组键损坏（resolve_items 抛 ScriptEditError）与 id 未命中两类错误都 fail-loud：
+        # 静默 no-op 等于把 worker 写完的 N 个 clip 路径丢弃但 SSE 仍广播「all updated」、UI
+        # 永远 pending。id 未命中收集一轮再统一抛，让 worker 看到完整失败集合而不是只看到首个；
+        # locked_script 在 with 体内抛异常时整体不写回（与 update_scene_asset 单个版本对齐）。
+        # resolve_items 让 reference 模式 worker 也能正确按 unit_id 索引 video_units。
         with self.locked_script(project_name, script_filename, validate=False) as script:
             content_mode = script.get("content_mode", "narration")
-            shape = _script_items_shape(script, content_mode)
-            items = script.get(shape.items_key, [])
-            id_field = shape.id_field
+            items, id_field, _kind = resolve_items(script)
 
             # 建立 scene_id → item 索引，避免 O(N*M) 查找
             item_by_id: dict[str, dict] = {str(item.get(id_field)): item for item in items}
+            missing: list[str] = []
 
             for scene_id, asset_type, asset_path in updates:
                 item = item_by_id.get(str(scene_id))
                 if item is None:
+                    missing.append(str(scene_id))
                     continue
 
                 assets = item.get("generated_assets")
@@ -1165,6 +1193,9 @@ class ProjectManager:
 
                 assets[asset_type] = asset_path
                 self.update_scene_status(item)
+
+            if missing:
+                raise KeyError(f"批量回写命中失败：以下分镜不存在 {sorted(set(missing))}")
         return script
 
     def get_pending_scenes(self, project_name: str, script_filename: str, asset_type: str) -> list[dict]:
@@ -1181,11 +1212,21 @@ class ProjectManager:
         """
         script = self.load_script(project_name, script_filename)
 
-        # 根据内容模式选择正确的数据结构
-        content_mode = script.get("content_mode", "narration")
-        items = script.get(_script_items_shape(script, content_mode).items_key, [])
+        # `_resolve_items_or_warn` 三模式判别 + 脏数据 warn-and-skip 降级——读取侧 silent
+        # 比写入侧 silent 安全（UI 渲染空列表好过 5xx 阻塞页面），但 warning 给可观测信号；
+        # 写入侧（update_scene_asset / batch_update_scene_assets）则用 `resolve_items` 直接
+        # 抛 ScriptEditError 保证数据损坏永远有显式信号。reference 模式下也能正确返回
+        # video_units，不会静默落到 drama 兜底丢失 reference 数据。
+        items = _resolve_items_or_warn(script, script_filename=script_filename)
 
-        return [item for item in items if not item["generated_assets"].get(asset_type)]
+        # item.generated_assets 缺失 / null / 非 dict 一律视为"未生成"——读取侧脏数据容错：
+        # `.get("generated_assets", {}).get(...)` 只挡 key 缺失，None 与非 dict 仍会抛 AttributeError。
+        # 与写入侧 update_scene_asset 的 isinstance check mirror。
+        def _missing(item: dict) -> bool:
+            assets = item.get("generated_assets")
+            return not isinstance(assets, dict) or not assets.get(asset_type)
+
+        return [item for item in items if _missing(item)]
 
     # ==================== 文件路径工具 ====================
 
@@ -1222,10 +1263,15 @@ class ProjectManager:
         """
         script = self.load_script(project_name, script_filename)
 
-        content_mode = script.get("content_mode", "narration")
-        items = script.get(_script_items_shape(script, content_mode).items_key, [])
+        # 同 get_pending_scenes：resolve_items 三模式判别 + warn-and-skip 降级 +
+        # generated_assets 容错 isinstance check。
+        items = _resolve_items_or_warn(script, script_filename=script_filename)
 
-        return [item for item in items if not item.get("generated_assets", {}).get("storyboard_image")]
+        def _missing_storyboard(item: dict) -> bool:
+            assets = item.get("generated_assets")
+            return not isinstance(assets, dict) or not assets.get("storyboard_image")
+
+        return [item for item in items if _missing_storyboard(item)]
 
     # ==================== 项目级元数据管理 ====================
 
@@ -1585,6 +1631,148 @@ class ProjectManager:
         if entries:
             self.update_project(project_name, _mutate)
         return added
+
+    def upsert_assets(self, project_name: str, table: str, entries: dict[str, dict]) -> dict[str, Any]:
+        """按 table（characters/scenes/props）+ name upsert 资产：不存在则新增、存在则改字段。
+
+        在 `update_project` 的单一文件锁内完成 read-modify-write；apply 后、落盘前对结果
+        project dict 做 payload 级结构校验，按**「不更坏」语义**裁决：仅当本次 upsert 把原本
+        合法的 project 改成非法时才 raise 且**不落盘**（mutation 抛错时 `update_project` 不执行
+        atomic_write）；改前已非法（历史遗留脏数据，如空 `style`）则照常放行——否则带历史问题的
+        项目会整条 patch_project 路径不可用（旧 `add_assets.py` 报告校验错误也不阻断写入）。
+        与剧本写盘统一入口的 `_guard_no_worse` 同源。把「只能加」扩为「可改」。
+
+        返回**诊断 dict**（不是 project 元数据）：``added``（新建条目名列表）、``merged``
+        （合并已有条目名列表）、``dropped_fields``（被白名单丢弃的非允许字段，{name: [字段名]}）、
+        ``dropped_legacy``（被剔除的历史字段如 type/importance，{name: [字段名]}）。caller
+        （MCP tool 层）据此构造对 agent 的明确反馈——silent drop 是设计意图（least privilege），
+        但纯 silent 让 agent 误以为 reference_image / sheet_field 写入成功；返回诊断让工具层
+        把忽略原因明示给 agent，避免 agent 重复尝试同样会被丢的字段。
+        """
+        # data_validator 在模块级 import 本模块（effective_mode），故惰性 import 破环。
+        from lib.data_validator import DataValidator
+
+        asset_type = self._BUCKET_TO_ASSET_TYPE.get(table)
+        if asset_type is None:
+            raise ValueError(f"未知资产表: {table!r}，须是 {sorted(self._BUCKET_TO_ASSET_TYPE)} 之一")
+        # 拆开两种失败 case 让 agent 错误更精确（之前合并的 "entries 不能为空" 无法区分两者）
+        if not isinstance(entries, dict):
+            raise ValueError(f"entries 必须是对象（dict），当前为 {type(entries).__name__}")
+        if not entries:
+            raise ValueError("entries 不能为空（至少需要一个 name → attrs 条目）")
+        # 规范化 name：strip 空白后非空。agent 误传 "  李白  " 这种带空格的 name 会让后续按
+        # name 索引查找（角色生成等）因空格差异 mismatch。空白 name 全空 fail-loud。
+        # 同时检测 strip 后冲突：{"李白": {...}, "  李白  ": {...}} 规范化后 key 相同 →
+        # 后者会 silent overwrite 前者；fail-loud 让 agent 明确感知 collision 并去重。
+        normalized_entries: dict[str, dict] = {}
+        raw_keys_by_normalized: dict[str, str] = {}
+        for raw_name, attrs in entries.items():
+            name = raw_name.strip() if isinstance(raw_name, str) else raw_name
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"{table} 的名称不能为空或仅含空白字符")
+            if not isinstance(attrs, dict):
+                raise ValueError(f"{table} '{name}' 的内容必须是对象")
+            if name in normalized_entries:
+                raise ValueError(
+                    f"{table} 的 entries 含规范化后冲突的 name {name!r}："
+                    f"原始键 {raw_keys_by_normalized[name]!r} 与 {raw_name!r} 在 strip 后等价"
+                )
+            normalized_entries[name] = attrs
+            raw_keys_by_normalized[name] = raw_name
+
+        spec = ASSET_SPECS[asset_type]
+        # 字段白名单走 spec 的「agent 权限维度」`agent_editable_extra_fields`，**不复用** schema 维度
+        # `extra_string_fields`——后者包括 `reference_image` 这类系统/用户路径字段（与 sheet_field
+        # 同性质，更新走 `update_character_reference_image` 专用 API），不该被 agent patch_project 直改。
+        # 不允许的字段同样含 `sheet_field`（character_sheet / scene_sheet / prop_sheet，资产生成流水线
+        # 在图像就绪后通过 `_update_asset_sheet` 专用 API 回写）以及 spec 之外的任意 key。
+        # `_strip_legacy_asset_fields` 处理 type/importance 等历史字段，这层再加白名单形成「最小特权」。
+        allowed_fields = {"description", *spec.agent_editable_extra_fields}
+        # 收集白名单丢字段 / 历史字段丢弃 给 caller 用于明示 agent。silent drop 仍是设计意图,
+        # 但通过返回 dict 把"被丢了什么"显式告诉工具层,工具层据此告知 agent,避免 LLM 重复尝试。
+        cleaned: dict[str, dict[str, Any]] = {}
+        dropped_fields: dict[str, list[str]] = {}  # name → [被白名单丢的字段]
+        dropped_legacy: dict[str, list[str]] = {}  # name → [被 _LEGACY_ASSET_FIELDS 剔除的字段]
+        for name, attrs in normalized_entries.items():
+            legacy_keys = sorted(set(attrs) & self._LEGACY_ASSET_FIELDS)
+            if legacy_keys:
+                dropped_legacy[name] = legacy_keys
+
+            entry_clean: dict[str, Any] = {}
+            non_allowed: list[str] = []
+            for k, v in self._strip_legacy_asset_fields(attrs).items():
+                if k in allowed_fields:
+                    entry_clean[k] = v
+                else:
+                    non_allowed.append(k)
+                    logger.debug(
+                        "upsert_assets: %s '%s' 的字段 %r 不在 agent 可编辑白名单 %s,已忽略",
+                        table,
+                        name,
+                        k,
+                        sorted(allowed_fields),
+                    )
+            if non_allowed:
+                dropped_fields[name] = sorted(non_allowed)
+            cleaned[name] = entry_clean
+
+        added: list[str] = []
+        merged: list[str] = []
+        noop: list[str] = []
+
+        def _mutate(project: dict) -> None:
+            validator = DataValidator(str(self.projects_root))
+            before_errors = set(validator.validate_project_payload(project).errors)  # 改前快照
+            bucket = project.setdefault(spec.bucket_key, {})
+            if not isinstance(bucket, dict):
+                # 历史脏数据：bucket_key 已存在却非 dict（如 list/str）。继续会让下方
+                # bucket.get/bucket[name].update 抛含糊的 AttributeError，故先 fail-loud
+                # 给出意外类型与 offending key（mutation 物理上无法对非 dict 施加，与「不更坏」无关）。
+                raise ValueError(f"project[{spec.bucket_key!r}] 必须是对象，当前为 {type(bucket).__name__}")
+            for name, attrs in cleaned.items():
+                existing = isinstance(bucket.get(name), dict)
+                # 仅对已存在 entry 检测 no-op:全字段被白名单/legacy strip 丢空时 update({})
+                # 实际不变,归到 noop 而非 merged 避免「合并 1 个」误报。新 entry 即使
+                # cleaned 空也仍走 _build_asset_entry,让 description 缺失的 validator 拒写
+                # fail-loud(不能让"无可写字段"变成绕过 entry 创建必填校验的旁路)。
+                if existing and not attrs:
+                    noop.append(name)
+                    continue
+                if existing:
+                    bucket[name].update(attrs)  # 改：合并字段，保留 sheet 路径等既有字段
+                    merged.append(name)
+                else:
+                    bucket[name] = self._build_asset_entry(asset_type, attrs.get("description", ""), attrs)
+                    added.append(name)
+            after_errors = set(validator.validate_project_payload(project).errors)
+            # 「不更坏」按 error set diff 判定：after 不应比 before 多任何 errors。
+            #   - 改前合法、改后非法 → new_errors=全部 after errors → 拒
+            #   - 改前已脏、改后相同脏 → new_errors=∅ → 放行（允许带历史脏数据的项目继续 patch）
+            #   - 改前已脏、改后引入新错误（如本次 entries 缺 description）→ new_errors≠∅ → 拒
+            #   - 改前已脏、改后修复了部分 → new_errors=∅ → 放行（允许 patch 改进历史脏数据）
+            # 比单纯比 valid 标志更严：堵住「带历史脏数据的项目里新 entry 的结构错误 piggyback 落盘」。
+            new_errors = after_errors - before_errors
+            if new_errors:
+                raise ValueError("project.json 结构校验失败: " + "; ".join(sorted(new_errors)))
+
+        self.update_project(project_name, _mutate)
+        return {
+            "added": added,
+            "merged": merged,
+            "noop": noop,
+            "dropped_fields": dropped_fields,
+            "dropped_legacy": dropped_legacy,
+        }
+
+    # bucket_key（characters/scenes/props）→ 资产类型，从静态 ASSET_SPECS 派生一次，避免每次 upsert 重建。
+    _BUCKET_TO_ASSET_TYPE = {spec.bucket_key: t for t, spec in ASSET_SPECS.items()}
+
+    _LEGACY_ASSET_FIELDS = frozenset({"type", "importance"})
+
+    @classmethod
+    def _strip_legacy_asset_fields(cls, attrs: dict) -> dict:
+        """剔除旧式 type/importance 字段（schema 演进遗留），返回新 dict。"""
+        return {k: v for k, v in attrs.items() if k not in cls._LEGACY_ASSET_FIELDS}
 
     def _update_asset_sheet(self, asset_type: str, project_name: str, name: str, sheet_path: str) -> dict:
         """更新资产 sheet 字段路径。资产不存在抛 KeyError。

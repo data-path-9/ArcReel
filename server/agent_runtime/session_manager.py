@@ -723,7 +723,7 @@ class SessionManager:
             }
 
         provider_env = await self._build_provider_env_overrides()
-        sandbox_typed = self._build_sandbox_settings()
+        sandbox_typed = self._build_sandbox_settings(project_cwd)
 
         # Windows 回退：sandbox 关闭时把 Bash 系列从 allowed_tools 剥离，
         # 让 _can_use_tool 接管 prefix 白名单匹配（_WINDOWS_BASH_PREFIX_WHITELIST）。
@@ -2101,7 +2101,7 @@ class SessionManager:
         "example.com",
     )
 
-    def _build_sandbox_settings(self) -> dict[str, Any]:
+    def _build_sandbox_settings(self, project_cwd: Path) -> dict[str, Any]:
         """构造 SandboxSettings dict（SDK 0.1.80 Python TypedDict 未声明
         filesystem 子结构，但 CLI 运行时透传 JSON 接受）。
 
@@ -2109,6 +2109,12 @@ class SessionManager:
           Bash 工具改走 ``_WINDOWS_BASH_PREFIX_WHITELIST`` 代码白名单。
         - ``filesystem.denyRead``：内核级文件读拒绝（macOS Seatbelt / Linux
           bwrap profile），对 sandbox 内所有子进程生效。
+        - ``filesystem.denyWrite``：内核级文件写拒绝，覆盖 ``scripts/`` 目录与
+          ``project.json``——这两类项目 JSON 的写入只能走 in-process MCP 工具
+          （``patch_episode_script`` / ``patch_project`` 等，跑在主进程不受 sandbox 约束），
+          堵死 Bash（``echo>`` / ``sed`` / ``python -c``）旁路。OS 级对 sandbox 内所有
+          子进程生效。删除 ``add_assets.py`` 后 sandbox 内已无合法 Bash 写这两类文件
+          （compose 写视频输出、split 写 ``source/``，均不碰），故不误伤。
         - ``allowUnsandboxedCommands=False``：禁止 agent 在 sandbox 失败时
           请求"重试 unsandboxed"，对红线场景不可接受。
         """
@@ -2120,8 +2126,24 @@ class SessionManager:
             "allowUnsandboxedCommands": False,
             "network": {"allowedDomains": list(self._DEFAULT_SANDBOX_ALLOWED_DOMAINS)},
             "enableWeakerNestedSandbox": bool(self._in_docker),
-            "filesystem": {"denyRead": self._build_sensitive_abs_paths()},
+            "filesystem": {
+                "denyRead": self._build_sensitive_abs_paths(),
+                "denyWrite": self._build_protected_json_abs_paths(project_cwd),
+            },
         }
+
+    @staticmethod
+    def _build_protected_json_abs_paths(project_cwd: Path) -> list[str]:
+        """项目 JSON 写禁清单（绝对路径）：``scripts/`` 目录子树 + ``project.json``。
+
+        与 ``_check_write_access`` 的内置 Write/Edit 拒绝同源（同两类路径），二者构成双层：
+        sandbox denyWrite 管 Bash 子进程（内核级），``_check_write_access`` hook 管内置
+        Write/Edit（权限系统，全平台）。
+        """
+        return [
+            str(project_cwd / "scripts"),
+            str(project_cwd / "project.json"),
+        ]
 
     def _build_sensitive_abs_paths(self) -> list[str]:
         """构造敏感文件绝对路径列表，传给 sandbox profile 的 denyRead 字段。
@@ -2188,7 +2210,12 @@ class SessionManager:
         """
         try:
             p = Path(file_path)
-            resolved = (project_cwd / p).resolve() if not p.is_absolute() else p.resolve()
+            logical = p if p.is_absolute() else project_cwd / p
+            # normpath 收敛 `.`/`..` 但不展开 symlink——保留「逻辑目标」与「resolve 后的真实
+            # 目标」两个视角，用来识别 symlink 起点（逻辑在 protected 区、resolve 跳到外面）
+            # 与 symlink 终点（逻辑在外、resolve 落入 protected 区）两类绕过。
+            logical_norm = Path(os.path.normpath(str(logical)))
+            resolved = logical.resolve()
         except (ValueError, OSError):
             return False, "访问被拒绝：无效的文件路径"
 
@@ -2197,7 +2224,7 @@ class SessionManager:
             return False, f"访问被拒绝：敏感文件不可访问 ({resolved})"
 
         if tool_name in self._WRITE_TOOLS:
-            return self._check_write_access(resolved, project_cwd)
+            return self._check_write_access(resolved, project_cwd, logical_norm=logical_norm)
         return self._check_read_access(resolved, project_cwd)
 
     @functools.cached_property
@@ -2274,10 +2301,40 @@ class SessionManager:
         # 其余路径（host 文件系统：~/.ssh、/etc 等）默认拒
         return False, (f"访问被拒绝：路径在项目根外 ({resolved})")
 
-    def _check_write_access(self, resolved: Path, project_cwd: Path) -> tuple[bool, str | None]:
-        """Write/Edit 的写入约束：cwd 外一律拒，cwd 内代码扩展名拒（agent 不写代码）。"""
-        if not resolved.is_relative_to(project_cwd):
+    def _check_write_access(self, resolved: Path, project_cwd: Path, *, logical_norm: Path) -> tuple[bool, str | None]:
+        """Write/Edit 的写入约束：cwd 外一律拒，cwd 内代码扩展名拒（agent 不写代码），
+        且 ``scripts/*.json`` 与 ``project.json`` 一律拒——只能走收归后的 MCP 工具。
+
+        所有 cwd-relative 判定（cwd 内外、protected 区命中）都按 **base 同时枚举 raw + resolved**
+        两种形式与 target 比对：caller 传入的 ``resolved`` 已展开 symlink，但 ``project_cwd`` 可能
+        是 symlink 入口（macOS ``/var↔/private/var``、Linux symlinked 项目根）。仅用 raw base 拼
+        protected 路径与 resolved target 字符串比对会失配 → bypass；同时枚举两种 base 保证同口径。
+        """
+        # 一次性 resolve project_cwd 同时枚举 raw 与 resolved 形式的 base，避免 symlinked
+        # project_cwd 下 is_relative_to / 受保护谓词因 base↔target 形式不一致漏判。bases 复用
+        # 给下游 `_is_protected_project_json`,后者直接消费列表不再做第二次 resolve（消除冗余 lstat）。
+        bases: list[Path] = [project_cwd]
+        try:
+            resolved_cwd = project_cwd.resolve(strict=False)
+            if resolved_cwd != project_cwd:
+                bases.append(resolved_cwd)
+        except (OSError, RuntimeError) as exc:
+            # 静默 pass 会让"权限不足 / symlink 环路解析失败" 类 fs 异常吃掉,后续
+            # is_relative_to 用 raw base 与 caller 传入的 resolved target 比对可能漏判;
+            # 失败时 fail-closed（bases 仅含 raw,target 不在 raw 下时拒绝写入）仍是安全的,
+            # 但加 warning 让运维知道 base 解析失败,而非把诊断信号全部吞掉。
+            logger.warning("project_cwd 解析失败,write_access 检查降级为仅 raw base: %s (%s)", project_cwd, exc)
+
+        if not any(resolved.is_relative_to(base) for base in bases):
             return False, (f"访问被拒绝：不允许写入当前项目目录之外的路径 ({resolved})")
+
+        if any(self._is_protected_project_json(target, bases) for target in (resolved, logical_norm)):
+            return False, (
+                "访问被拒绝：scripts/*.json 与 project.json 不可用 Write/Edit 直改，"
+                "请改用 MCP 工具——剧本编辑走 mcp__arcreel__patch_episode_script / "
+                "mcp__arcreel__insert_segment / mcp__arcreel__remove_segment / mcp__arcreel__split_segment，"
+                "角色/场景/道具走 mcp__arcreel__patch_project。"
+            )
 
         ext = resolved.suffix.lower()
         if ext in self._CODE_EXTENSIONS_FORBIDDEN:
@@ -2288,6 +2345,42 @@ class SessionManager:
             )
 
         return True, None
+
+    @staticmethod
+    def _is_protected_project_json(target: Path, bases: list[Path]) -> bool:
+        """命中受保护的项目 JSON（``scripts/`` 下任意 .json，或根 ``project.json``）。
+
+        caller 应分别对「逻辑目标」（normpath 收敛 `.`/`..` 但不展开 symlink）和「resolve
+        后的真实目标」各调一次：任一落入 protected 区都判定命中——覆盖项目内 symlink 起点
+        指 protected 路径（resolved 跳到外）与终点指 protected 路径（逻辑在外、resolved 跳入）
+        两类绕过。
+
+        ``bases`` 由 caller(`_check_write_access`)一次性传入 raw + resolved 两种形式的
+        project_cwd 列表（同口径 raw/resolved 与 target 比对，避免 macOS ``/var↔/private/var``、
+        Linux symlinked 项目根下漏判），本谓词消费现成 list 不再自行 resolve（消除冗余 lstat）。
+
+        路径用 ``casefold`` 后比较：Windows NTFS / macOS APFS 默认卷是大小写不敏感文件系统，
+        ``PROJECT.JSON`` 与 ``project.json`` 指向同一物理文件，但 ``Path`` 字符串比较 case-sensitive
+        会漏判这一类大小写变体绕过。Linux case-sensitive 卷上 agent 实际不会用大小写变体，
+        casefold 的偶尔 over-match 不会破坏 fail-loud 语义。
+
+        与 sandbox ``denyWrite`` 同源；此谓词覆盖内置 Write/Edit（权限系统，全平台），
+        与 denyWrite（Bash 子进程，内核级）构成双层。
+        """
+        target_s = str(target).casefold()
+
+        for base in bases:
+            if target_s == str(base / "project.json").casefold():
+                return True
+            scripts_dir = str(base / "scripts").casefold()
+            # 拒绝 scripts/ 子树（含目录本身）：sandbox denyWrite 把整个 scripts/ 列入内核级 deny，
+            # hook 层须保持一致——否则 agent 用 Write 写 scripts/foo.bak / .tmp / .md 会污染剧本
+            # 目录，破坏项目结构约定（scripts/ 是剧本 .json 专属，drafts/ 才放草稿）。
+            # 同时显式覆盖目录路径本身（target == scripts_dir）：agent 把目录名当文件路径 Write 时
+            # 文件系统会拒，但 hook 层 fail-fast 优先，不依赖 OS 兜底。
+            if target_s == scripts_dir or target_s.startswith(scripts_dir + os.sep):
+                return True
+        return False
 
     async def _handle_ask_user_question(
         self,

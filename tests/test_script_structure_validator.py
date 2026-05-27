@@ -88,14 +88,34 @@ class TestValidScripts:
 
 
 class TestModeDetection:
-    def test_reference_video_takes_priority_over_content_mode(self):
-        """generation_mode=reference_video 即使 content_mode=narration 也走 ReferenceVideoScript。
+    def test_video_units_only_picks_reference_model(self):
+        """video_units 唯一存在(无 segments/scenes)时走 ReferenceVideoScript,不论
+        content_mode 标记是什么——按数据形状路由(动作 5 引入)。
 
-        reference 剧本只有 video_units、无 segments；若误判为 NarrationEpisodeScript 会因缺
+        reference 剧本只有 video_units、无 segments;若误判为 NarrationEpisodeScript 会因缺
         segments 而 invalid。结果 valid 证明判别走了 ReferenceVideoScript。
         """
         script = _reference(content_mode="narration")
         assert script.get("content_mode") == "narration"
+        assert validate_script_structure(script).valid
+
+    def test_partial_migration_segments_picks_narration_model(self):
+        """partial migration:generation_mode='reference_video' 但数据还在 segments,
+        应按数据形状走 NarrationEpisodeScript 而非让 generation_mode 单向赢——
+        若强制 ReferenceVideoScript 校验会因 video_units 缺失 invalid。
+        """
+        # 用 _narration() 的 segments,但带 generation_mode='reference_video' 标记(partial migration)
+        script = _narration()
+        script["generation_mode"] = "reference_video"
+        assert validate_script_structure(script).valid
+
+    def test_stray_video_units_do_not_hijack_storyboard_script(self):
+        """历史脏数据：narration 脚本被误塞游离 video_units。video_units 与 segments 并存且无
+        显式 reference 模式时，判别不应抢到 ReferenceVideoScript（会因缺合法 units 拒写真实
+        segments），而应按 content_mode 走 Narration（多余 video_units 键被 extra=ignore 忽略）。
+        """
+        script = _narration()
+        script["video_units"] = [{"unit_id": "E1U1", "generated_assets": {"status": "pending"}}]
         assert validate_script_structure(script).valid
 
     def test_drama_detected_by_scenes(self):

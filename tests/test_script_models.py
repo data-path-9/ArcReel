@@ -259,6 +259,43 @@ class TestRuntimeBackwardCompat:
         assert scene.scene_id == "E1S01"
         assert not hasattr(scene, "scene_type")
 
+    def test_narration_segment_accepts_legacy_clues_in_segment_field(self):
+        """v0→v1 migration 删的 clues_in_segment 残留时 model_validate 不该炸。"""
+        segment = NarrationSegment.model_validate(
+            {
+                "segment_id": "E1S01",
+                "duration_seconds": 4,
+                "novel_text": "原文",
+                "characters_in_segment": ["王"],
+                "image_prompt": {
+                    "scene": "s",
+                    "composition": {"shot_type": "Medium Shot", "lighting": "l", "ambiance": "a"},
+                },
+                "video_prompt": {"action": "a", "camera_motion": "Static", "ambiance_audio": "x"},
+                "clues_in_segment": ["玉佩"],
+            }
+        )
+        assert segment.segment_id == "E1S01"
+        assert not hasattr(segment, "clues_in_segment")
+
+    def test_drama_scene_accepts_legacy_clues_in_scene_field(self):
+        """v0→v1 migration 删的 clues_in_scene 残留时 model_validate 不该炸。"""
+        scene = DramaScene.model_validate(
+            {
+                "scene_id": "E1S01",
+                "duration_seconds": 8,
+                "characters_in_scene": ["王"],
+                "image_prompt": {
+                    "scene": "s",
+                    "composition": {"shot_type": "Medium Shot", "lighting": "l", "ambiance": "a"},
+                },
+                "video_prompt": {"action": "a", "camera_motion": "Static", "ambiance_audio": "x"},
+                "clues_in_scene": ["玉佩"],
+            }
+        )
+        assert scene.scene_id == "E1S01"
+        assert not hasattr(scene, "clues_in_scene")
+
     def test_episode_models_validate_without_optional_fields(self):
         """LLM 不写 content_mode / novel / summary 时,model_validate 仍应成功并用 default 兜底。"""
         drama = DramaEpisodeScript.model_validate(
@@ -306,3 +343,35 @@ class TestRuntimeBackwardCompat:
             }
         )
         assert seg.transition_to_next == "cut"
+
+
+class TestGeneratedAssetsTemplateContract:
+    """GeneratedAssets 模型与 create_generated_assets() dict 模板必须保持字段一致。
+
+    模型开 extra="forbid" 后,运行时回写若出现模型未声明的字段,会被 _guard_no_worse
+    在 before/after 差集中检测为 extra_forbidden 拒整集写盘——例如视频生成完成后
+    reference_video_tasks 在 ga 上写 "video_thumbnail" 时整集拒。本测试守住「模板
+    写入字段⊆模型声明字段」契约。
+    """
+
+    def test_template_dict_validates_against_generated_assets_model(self):
+        from lib.project_manager import ProjectManager
+        from lib.script_models import GeneratedAssets
+
+        # 不抛即通过——template 任何 key 不在模型字段集时 extra="forbid" 会抛 ValidationError
+        GeneratedAssets.model_validate(ProjectManager.create_generated_assets())
+        GeneratedAssets.model_validate(ProjectManager.create_generated_assets("drama"))
+
+    def test_video_thumbnail_runtime_write_passes_strict_validation(self):
+        """reference_video_tasks 在视频生成后会写 ga['video_thumbnail'],模型必须接受。"""
+        from lib.script_models import GeneratedAssets
+
+        GeneratedAssets.model_validate(
+            {
+                "storyboard_image": "scenes/E1S01.png",
+                "video_clip": "videos/E1S01.mp4",
+                "video_thumbnail": "thumbnails/E1S01.jpg",
+                "video_uri": "https://example/v",
+                "status": "completed",
+            }
+        )

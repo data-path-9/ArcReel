@@ -17,7 +17,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from lib.config.registry import PROVIDER_REGISTRY
 from lib.config.resolver import ConfigResolver
 from lib.db import async_session_factory
-from lib.project_manager import effective_mode
+from lib.project_manager import ProjectManager, effective_mode
 from lib.prompt_builders_reference import build_reference_video_prompt
 from lib.prompt_builders_script import (
     build_drama_prompt,
@@ -105,20 +105,33 @@ class ScriptGenerator:
     async def generate(
         self,
         episode: int,
-        output_path: Path | None = None,
+        output_filename: str | None = None,
     ) -> Path:
         """
         异步生成剧集剧本
 
         Args:
             episode: 剧集编号
-            output_path: 输出路径，默认为 scripts/episode_{episode}.json
+            output_filename: 输出文件名，默认 episode_{episode}.json。剧本一律经写盘统一入口写入
+                项目 scripts/ 目录，故此参数只决定文件名、不接受目录。
 
         Returns:
             生成的 JSON 文件路径
         """
         if self.generator is None:
             raise RuntimeError("TextGenerator 未初始化，请使用 ScriptGenerator.create() 工厂方法")
+
+        # 兑现 docstring 的「只决定文件名、不接受目录」契约:写盘咽喉 _safe_subpath 能挡绝对
+        # 路径与 path traversal,但不会挡子目录(`subdir/x.json` 拼出的 realpath 仍在 scripts/
+        # 内,会让剧本写到 scripts/subdir/x.json,偏离扁平布局)。在公开 API 入口 fail-fast 拒,
+        # 既兑现契约也避免跑完整套生成流程才撞到错。
+        # 显式拒 `\\`:POSIX 上 Path 不当其为分隔符,但 Windows 上是;按跨平台兼容做防御。
+        # 空字符串 "" 也显式拒:Path("").name == "" 等于 output_filename 会过前两条,
+        # 带空 filename 流到 save_script 在写盘阶段才崩;入口 fail-fast 才不撕裂时机。
+        if output_filename is not None and (
+            not output_filename or Path(output_filename).name != output_filename or "\\" in output_filename
+        ):
+            raise ValueError(f"output_filename 只接受纯文件名，不允许目录或路径分隔符: {output_filename!r}")
 
         gen_mode = self._effective_generation_mode(episode)
         caps = await self._fetch_video_capabilities()
@@ -195,13 +208,12 @@ class ScriptGenerator:
         # 6. 补充元数据
         script_data = self._add_metadata(script_data, episode)
 
-        # 7. 保存文件
-        if output_path is None:
-            output_path = self.project_path / "scripts" / f"episode_{episode}.json"
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(script_data, f, ensure_ascii=False, indent=2)
+        # 7. 经写盘统一入口保存：整集生成无「改前」，按严格结构校验（等价原 response_schema 的
+        #    Pydantic 校验），并继承 metadata 重算、加锁、filename↔episode 一致性与 project.json
+        #    同步——消除「裸 json.dump 旁路」，使 _write_script_unlocked 成为剧本唯一写入点。
+        filename = output_filename or f"episode_{episode}.json"
+        pm = ProjectManager(str(self.project_path.parent))
+        output_path = pm.save_script(self.project_path.name, script_data, filename, validate=True)
 
         self._quality_probe(script_data, episode)
 

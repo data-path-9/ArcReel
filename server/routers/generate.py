@@ -19,6 +19,7 @@ from lib.generation_queue import get_generation_queue
 from lib.generation_queue_client import TaskSpec, TaskSpecValidationError
 from lib.i18n import Translator
 from lib.project_manager import ProjectManager
+from lib.script_editor import ScriptEditError
 from lib.storyboard_sequence import (
     find_storyboard_item,
     get_storyboard_items,
@@ -125,6 +126,9 @@ async def generate_storyboard(
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException:
         raise
+    except ScriptEditError as e:
+        # 脏脚本(分镜数组键损坏)→ 4xx 客户端错误而非 5xx,detail 走 i18n 不直接暴露 str(e)
+        raise HTTPException(status_code=400, detail=_t("script_data_corrupted", reason=str(e)))
     except Exception as e:
         logger.exception("请求处理失败")
         raise HTTPException(status_code=500, detail=str(e))
@@ -167,6 +171,15 @@ async def generate_video(
             except FileNotFoundError:
                 # 脚本不存在交由后续流程报错；此处只负责存在性检查
                 pass
+            except ScriptEditError as exc:
+                # 脏脚本(分镜数组键损坏)→ fail-fast 4xx,与 storyboard endpoint 对齐。
+                # 不再 silently pass 降级走 default 路径:default 文件恰好存在时会让请求
+                # 「先返回提交成功、worker 解析脚本时再确定失败」,撕裂用户预期;脚本损坏是
+                # 路由层就能识别的客户端错误,提前 4xx 比让 worker 后置失败更准确。
+                raise HTTPException(
+                    status_code=400,
+                    detail=_t("script_data_corrupted", reason=str(exc)),
+                )
 
             storyboard_file = (
                 project_path / storyboard_rel
