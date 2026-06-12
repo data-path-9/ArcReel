@@ -7,7 +7,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useConfigStatusStore } from "@/stores/config-status-store";
 import { useProjectsStore } from "@/stores/projects-store";
 import { StudioCanvasRouter } from "@/components/canvas/StudioCanvasRouter";
-import type { EpisodeScript, ProjectData } from "@/types";
+import type { AdEpisodeScript, EpisodeScript, ProjectData } from "@/types";
 
 vi.mock("./OverviewCanvas", () => ({
   OverviewCanvas: () => <div data-testid="overview-canvas">Overview</div>,
@@ -22,7 +22,10 @@ vi.mock("./SourceFileViewer", () => ({
 vi.mock("./timeline/TimelineCanvas", () => ({
   TimelineCanvas: ({
     episodeScript,
+    scriptFile,
+    durationOptions,
     onUpdatePrompt,
+    onMoveShot,
     onGenerateStoryboard,
     onGenerateVideo,
     onGenerateNarration,
@@ -31,7 +34,14 @@ vi.mock("./timeline/TimelineCanvas", () => ({
     canEditTitle,
   }: {
     episodeScript: unknown;
-    onUpdatePrompt?: (segmentId: string, field: string, value: unknown) => void;
+    scriptFile?: string;
+    durationOptions?: number[];
+    onUpdatePrompt?: (segmentId: string, field: string, value: unknown, scriptFile?: string) => void;
+    onMoveShot?: (
+      shotId: string,
+      direction: "earlier" | "later",
+      scriptFile?: string,
+    ) => Promise<boolean> | void;
     onGenerateStoryboard?: (segmentId: string) => void;
     onGenerateVideo?: (segmentId: string) => void;
     onGenerateNarration?: (segmentId: string) => void;
@@ -42,8 +52,19 @@ vi.mock("./timeline/TimelineCanvas", () => ({
     <div data-testid="timeline-canvas">
       <div data-testid="timeline-has-script">{episodeScript ? "yes" : "no"}</div>
       <div data-testid="timeline-can-edit-title">{canEditTitle ? "yes" : "no"}</div>
-      <button onClick={() => onUpdatePrompt?.("SEG-1", "image_prompt", "new prompt")}>
+      <div data-testid="timeline-duration-options">{(durationOptions ?? []).join(",")}</div>
+      <button onClick={() => onUpdatePrompt?.("SEG-1", "image_prompt", "new prompt", scriptFile)}>
         update-prompt
+      </button>
+      <button
+        onClick={(e) => {
+          const el = e.currentTarget;
+          void Promise.resolve(onMoveShot?.("SEG-1", "later", scriptFile)).then((moved) => {
+            el.setAttribute("data-move-result", String(moved));
+          });
+        }}
+      >
+        move-shot-later
       </button>
       <button onClick={() => onGenerateStoryboard?.("SEG-1")}>generate-storyboard</button>
       <button onClick={() => onGenerateVideo?.("SEG-1")}>generate-video</button>
@@ -556,6 +577,7 @@ describe("StudioCanvasRouter", () => {
     fireEvent.click(screen.getByText("update-prompt"));
     await waitFor(() => {
       expect(API.updateSegment).toHaveBeenCalledWith("demo", "SEG-1", {
+        script_file: "episode_1.json",
         image_prompt: "new prompt",
       });
       expect(useAppStore.getState().toast?.text).toContain("更新 Prompt 失败");
@@ -631,6 +653,153 @@ describe("StudioCanvasRouter", () => {
         5,
       );
     });
+  });
+
+  it("dispatches ad prompt updates to the shot PATCH endpoint", async () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({ content_mode: "ad" }),
+      currentScripts: { "episode_1.json": makeAdScript() },
+    });
+
+    vi.spyOn(API, "getProject").mockResolvedValue({
+      project: makeProjectData({ content_mode: "ad" }),
+      scripts: { "episode_1.json": makeAdScript() },
+    });
+    const updateShotSpy = vi.spyOn(API, "updateShot").mockResolvedValue({ success: true });
+    const updateSceneSpy = vi.spyOn(API, "updateScene").mockResolvedValue({ success: true });
+    const updateSegmentSpy = vi.spyOn(API, "updateSegment").mockResolvedValue({ success: true });
+
+    renderAt("/episodes/1");
+
+    fireEvent.click(screen.getByText("update-prompt"));
+    await waitFor(() => {
+      expect(updateShotSpy).toHaveBeenCalledWith("demo", "SEG-1", "episode_1.json", {
+        image_prompt: "new prompt",
+      });
+    });
+    expect(updateSceneSpy).not.toHaveBeenCalled();
+    expect(updateSegmentSpy).not.toHaveBeenCalled();
+  });
+
+  it("moves an ad shot by submitting the full reordered id list", async () => {
+    const script = makeAdScript() as AdEpisodeScript;
+    script.shots.push({
+      shot_id: "SEG-2",
+      section: "cta",
+      duration_seconds: 3,
+      voiceover_text: "立即下单",
+      image_prompt: "p2",
+      video_prompt: "v2",
+      transition_to_next: "cut",
+    });
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({ content_mode: "ad" }),
+      currentScripts: { "episode_1.json": script },
+    });
+
+    vi.spyOn(API, "getProject").mockResolvedValue({
+      project: makeProjectData({ content_mode: "ad" }),
+      scripts: { "episode_1.json": script },
+    });
+    const reorderSpy = vi.spyOn(API, "reorderShots").mockResolvedValue({ success: true });
+
+    renderAt("/episodes/1");
+
+    fireEvent.click(screen.getByText("move-shot-later"));
+    await waitFor(() => {
+      expect(reorderSpy).toHaveBeenCalledWith("demo", "episode_1.json", ["SEG-2", "SEG-1"]);
+    });
+    // 重排 + 本地刷新都成功 → 报告移动成功
+    await waitFor(() => {
+      expect(screen.getByText("move-shot-later")).toHaveAttribute("data-move-result", "true");
+    });
+  });
+
+  it("reports move failure and toasts when the reorder request fails", async () => {
+    const script = makeAdScript() as AdEpisodeScript;
+    script.shots.push({
+      shot_id: "SEG-2",
+      section: "cta",
+      duration_seconds: 3,
+      voiceover_text: "立即下单",
+      image_prompt: "p2",
+      video_prompt: "v2",
+      transition_to_next: "cut",
+    });
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({ content_mode: "ad" }),
+      currentScripts: { "episode_1.json": script },
+    });
+
+    vi.spyOn(API, "getProject").mockResolvedValue({
+      project: makeProjectData({ content_mode: "ad" }),
+      scripts: { "episode_1.json": script },
+    });
+    vi.spyOn(API, "reorderShots").mockRejectedValue(new Error("server boom"));
+
+    renderAt("/episodes/1");
+
+    fireEvent.click(screen.getByText("move-shot-later"));
+    await waitFor(() => {
+      expect(screen.getByText("move-shot-later")).toHaveAttribute("data-move-result", "false");
+    });
+    expect(useAppStore.getState().toast?.text).toContain("server boom");
+    expect(useAppStore.getState().toast?.tone).toBe("error");
+  });
+
+  it("reports move failure when local refresh fails after a successful reorder", async () => {
+    const script = makeAdScript() as AdEpisodeScript;
+    script.shots.push({
+      shot_id: "SEG-2",
+      section: "cta",
+      duration_seconds: 3,
+      voiceover_text: "立即下单",
+      image_prompt: "p2",
+      video_prompt: "v2",
+      transition_to_next: "cut",
+    });
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({ content_mode: "ad" }),
+      currentScripts: { "episode_1.json": script },
+    });
+
+    // 重排接口成功，但项目刷新失败：本地 segments 仍是旧顺序，
+    // 必须报告失败，否则调用方会推进 selectedIndex 切到错误镜头
+    vi.spyOn(API, "getProject").mockRejectedValue(new Error("network down"));
+    vi.spyOn(API, "reorderShots").mockResolvedValue({ success: true });
+
+    renderAt("/episodes/1");
+
+    fireEvent.click(screen.getByText("move-shot-later"));
+    await waitFor(() => {
+      expect(screen.getByText("move-shot-later")).toHaveAttribute("data-move-result", "false");
+    });
+  });
+
+  it("routes ad + reference_video projects to the shot editor with free 1-15s durations", () => {
+    useProjectsStore.setState({
+      currentProjectName: "demo",
+      currentProjectData: makeProjectData({
+        content_mode: "ad",
+        generation_mode: "reference_video",
+      }),
+      currentScripts: { "episode_1.json": makeAdScript() },
+    });
+    vi.spyOn(API, "getProject").mockResolvedValue({
+      project: makeProjectData({ content_mode: "ad", generation_mode: "reference_video" }),
+      scripts: { "episode_1.json": makeAdScript() },
+    });
+
+    renderAt("/episodes/1");
+
+    expect(screen.getByTestId("timeline-canvas")).toBeInTheDocument();
+    expect(screen.getByTestId("timeline-duration-options").textContent).toBe(
+      Array.from({ length: 15 }, (_, i) => i + 1).join(","),
+    );
   });
 
   it("resolves drama scenes by scene_id when generating storyboard", async () => {

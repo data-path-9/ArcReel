@@ -38,6 +38,7 @@ from lib.project_manager import EpisodeScriptReboundError, ProjectManager
 from lib.status_calculator import StatusCalculator
 from lib.style_templates import is_known_template, resolve_template_prompt
 from server.auth import CurrentUser, create_download_token, verify_download_token
+from server.routers._reorder import full_permutation_error
 from server.routers._validators import validate_backend_value
 from server.services.project_archive import (
     ProjectArchiveService,
@@ -865,6 +866,149 @@ async def update_scene(name: str, scene_id: str, req: UpdateSceneRequest, _user:
     except ValueError as exc:
         # 结构校验失败、集号错配、非法文件名都抛 ValueError（ScriptStructureValidationError
         # 即其子类）：统一转 422 客户端错误，避免落到下面的 500 兜底。
+        raise HTTPException(
+            status_code=422,
+            detail=_t("script_validation_failed", details=str(exc)),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("请求处理失败")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class UpdateShotRequest(BaseModel):
+    script_file: str
+    updates: dict
+
+
+# ad 镜头 PATCH 白名单：shot_id（定位键）与 generated_assets（运行时状态）不可改写。
+_SHOT_UPDATABLE_FIELDS = (
+    "section",
+    "voiceover_text",
+    "duration_seconds",
+    "image_prompt",
+    "video_prompt",
+    "characters_in_shot",
+    "scenes",
+    "props",
+    "products_in_shot",
+    "transition_to_next",
+    "note",
+)
+
+
+def _require_ad_script(script: dict, _t: Translator) -> list[dict]:
+    """断言剧本是 ad 形状（content_mode=ad 且含 shots 键），返回 shots 列表。
+
+    与 update_segment 的 narration 守卫同模式：其他模式的脚本即使残留 shots 键也拒绝，
+    避免被当 ad 改写。
+    """
+    if script.get("content_mode") != "ad" or "shots" not in script:
+        raise HTTPException(status_code=400, detail=_t("ad_mode_required"))
+    shots = script.get("shots")
+    # 非法形状 fail loud：静默降级为空列表会让 reorder 在客户端传空 shot_ids 时
+    # 把损坏的 shots 覆盖成 []，直接丢数据。ValueError 由路由统一转 422。
+    if not isinstance(shots, list):
+        raise ValueError("ad script field 'shots' must be a list")
+    if not all(isinstance(s, dict) for s in shots):
+        raise ValueError("ad script field 'shots' contains non-object elements")
+    # shot_id 缺失/脏类型同样拦下：否则 PATCH 按 id 定位会误报 404，
+    # reorder 的 s["shot_id"] 索引会 KeyError 变 500。
+    if not all(isinstance(s.get("shot_id"), str) and s["shot_id"] for s in shots):
+        raise ValueError("ad script field 'shots' contains elements missing valid 'shot_id'")
+    # shot_id 是单镜头身份键：重复值会让 PATCH 静默更新首个命中项、reorder 失去 1:1 映射
+    shot_ids = [s["shot_id"] for s in shots]
+    if len(set(shot_ids)) != len(shot_ids):
+        raise ValueError("ad script field 'shots' contains duplicate 'shot_id' values")
+    return shots
+
+
+@router.patch("/projects/{name}/script-shots/{shot_id}")
+async def update_shot(name: str, shot_id: str, req: UpdateShotRequest, _user: CurrentUser, _t: Translator):
+    """更新 ad 模式剧本中的单个镜头（按 shot_id 定位）。
+
+    路径风格与 ``script-scenes`` 对齐；口播文案 / section / 时长 / 引用列表等
+    白名单字段可改，结构合法性由写盘统一入口的「不更坏」校验兜底。
+    """
+    try:
+
+        def _sync():
+            manager = get_project_manager()
+
+            # 整段 RMW 在单一 _script_lock 内完成；模式不符 / 未命中时在锁内 raise，跳过写回
+            matched_shot: dict[str, Any] | None = None
+            with project_change_source("webui"):
+                with manager.locked_script(name, req.script_file) as script:
+                    for shot in _require_ad_script(script, _t):
+                        if shot.get("shot_id") == shot_id:
+                            matched_shot = shot
+                            for key, value in req.updates.items():
+                                if key in _SHOT_UPDATABLE_FIELDS:
+                                    # note 允许显式置 None（清空备注），其余字段 None 视为未提供
+                                    if value is None and key != "note":
+                                        continue
+                                    shot[key] = value
+                            break
+
+                    if matched_shot is None:
+                        raise HTTPException(status_code=404, detail=_t("shot_not_found", id=shot_id))
+            return {"success": True, "shot": matched_shot}
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=_t("script_not_found", name=req.script_file))
+    except ValueError as exc:
+        # 结构校验失败、集号错配、非法文件名都抛 ValueError（ScriptStructureValidationError
+        # 即其子类）：统一转 422 客户端错误，避免落到下面的 500 兜底。
+        raise HTTPException(
+            status_code=422,
+            detail=_t("script_validation_failed", details=str(exc)),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("请求处理失败")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ReorderShotsRequest(BaseModel):
+    script_file: str
+    shot_ids: list[str]
+
+
+@router.post("/projects/{name}/script-shots/reorder")
+async def reorder_shots(name: str, req: ReorderShotsRequest, _user: CurrentUser, _t: Translator):
+    """按给定全排列重排 ad 剧本的 shots 顺序（与参考视频 units/reorder 同语义）。"""
+    try:
+
+        def _sync():
+            manager = get_project_manager()
+
+            with project_change_source("webui"):
+                with manager.locked_script(name, req.script_file) as script:
+                    shots = _require_ad_script(script, _t)
+                    existing_ids = [s.get("shot_id") for s in shots]
+
+                    # 校验失败 → 在锁内 raise 400，跳过写回
+                    error_kind = full_permutation_error(existing_ids, req.shot_ids)
+                    if error_kind is not None:
+                        detail_key = {
+                            "length": "shot_ids_length_mismatch",
+                            "duplicate": "duplicate_shot_ids",
+                            "mismatch": "shot_ids_mismatch",
+                        }[error_kind]
+                        raise HTTPException(status_code=400, detail=_t(detail_key))
+
+                    by_id = {s["shot_id"]: s for s in shots}
+                    reordered = [by_id[sid] for sid in req.shot_ids]
+                    script["shots"] = reordered
+            return {"success": True, "shots": reordered}
+
+        return await asyncio.to_thread(_sync)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=_t("script_not_found", name=req.script_file))
+    except ValueError as exc:
         raise HTTPException(
             status_code=422,
             detail=_t("script_validation_failed", details=str(exc)),

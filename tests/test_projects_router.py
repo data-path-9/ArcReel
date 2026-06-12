@@ -611,6 +611,208 @@ class TestProjectsRouter:
             assert update_overview.status_code == 200
             assert update_overview.json()["overview"]["synopsis"] == "new synopsis"
 
+    @staticmethod
+    def _ad_script(shot_ids: list[str]) -> dict:
+        return {
+            "content_mode": "ad",
+            "shots": [
+                {
+                    "shot_id": sid,
+                    "section": "hook",
+                    "duration_seconds": 4,
+                    "voiceover_text": f"口播 {sid}",
+                    "products_in_shot": [],
+                }
+                for sid in shot_ids
+            ],
+        }
+
+    def test_update_shot_edits_voiceover_section_duration(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.scripts[("ad-ready", "episode_1.json")] = self._ad_script(["E1S01", "E1S02"])
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            patched = client.patch(
+                "/api/v1/projects/ad-ready/script-shots/E1S01",
+                json={
+                    "script_file": "episode_1.json",
+                    "updates": {
+                        "voiceover_text": "新口播",
+                        "section": "demo",
+                        "duration_seconds": 6,
+                        "products_in_shot": ["速干杯"],
+                    },
+                },
+            )
+            assert patched.status_code == 200
+            shot = patched.json()["shot"]
+            assert shot["voiceover_text"] == "新口播"
+            assert shot["section"] == "demo"
+            assert shot["duration_seconds"] == 6
+            assert shot["products_in_shot"] == ["速干杯"]
+            # 持久化落到脚本存储
+            saved = fake_pm.scripts[("ad-ready", "episode_1.json")]["shots"][0]
+            assert saved["voiceover_text"] == "新口播"
+
+    def test_update_shot_ignores_non_whitelisted_fields(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.scripts[("ad-ready", "episode_1.json")] = self._ad_script(["E1S01"])
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            patched = client.patch(
+                "/api/v1/projects/ad-ready/script-shots/E1S01",
+                json={
+                    "script_file": "episode_1.json",
+                    "updates": {"shot_id": "E1S99", "generated_assets": {"status": "completed"}, "note": "备注"},
+                },
+            )
+            assert patched.status_code == 200
+            saved = fake_pm.scripts[("ad-ready", "episode_1.json")]["shots"][0]
+            assert saved["shot_id"] == "E1S01"
+            assert "generated_assets" not in saved
+            assert saved["note"] == "备注"
+
+    def test_update_shot_rejects_non_ad_script(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            rejected = client.patch(
+                "/api/v1/projects/ready/script-shots/001",
+                json={"script_file": "episode_1.json", "updates": {"voiceover_text": "x"}},
+            )
+            assert rejected.status_code == 400
+
+    def test_update_shot_unknown_id_404(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.scripts[("ad-ready", "episode_1.json")] = self._ad_script(["E1S01"])
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            missing = client.patch(
+                "/api/v1/projects/ad-ready/script-shots/E1S99",
+                json={"script_file": "episode_1.json", "updates": {"voiceover_text": "x"}},
+            )
+            assert missing.status_code == 404
+
+    def test_reorder_shots_full_permutation(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.scripts[("ad-ready", "episode_1.json")] = self._ad_script(["E1S01", "E1S02", "E1S03"])
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            reordered = client.post(
+                "/api/v1/projects/ad-ready/script-shots/reorder",
+                json={"script_file": "episode_1.json", "shot_ids": ["E1S03", "E1S01", "E1S02"]},
+            )
+            assert reordered.status_code == 200
+            assert [s["shot_id"] for s in reordered.json()["shots"]] == ["E1S03", "E1S01", "E1S02"]
+            saved = fake_pm.scripts[("ad-ready", "episode_1.json")]["shots"]
+            assert [s["shot_id"] for s in saved] == ["E1S03", "E1S01", "E1S02"]
+
+    def test_reorder_shots_rejects_mismatched_ids(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.scripts[("ad-ready", "episode_1.json")] = self._ad_script(["E1S01", "E1S02"])
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            # 数量不一致
+            short = client.post(
+                "/api/v1/projects/ad-ready/script-shots/reorder",
+                json={"script_file": "episode_1.json", "shot_ids": ["E1S01"]},
+            )
+            assert short.status_code == 400
+            # 重复 ID
+            dup = client.post(
+                "/api/v1/projects/ad-ready/script-shots/reorder",
+                json={"script_file": "episode_1.json", "shot_ids": ["E1S01", "E1S01"]},
+            )
+            assert dup.status_code == 400
+            # 集合不匹配
+            mismatch = client.post(
+                "/api/v1/projects/ad-ready/script-shots/reorder",
+                json={"script_file": "episode_1.json", "shot_ids": ["E1S01", "E1S99"]},
+            )
+            assert mismatch.status_code == 400
+            # 原顺序未被破坏
+            saved = fake_pm.scripts[("ad-ready", "episode_1.json")]["shots"]
+            assert [s["shot_id"] for s in saved] == ["E1S01", "E1S02"]
+
+    def test_reorder_shots_rejects_non_ad_script(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            rejected = client.post(
+                "/api/v1/projects/ready/script-shots/reorder",
+                json={"script_file": "episode_1.json", "shot_ids": ["001"]},
+            )
+            assert rejected.status_code == 400
+
+    def test_corrupted_shots_shape_fails_loud_not_silently_wiped(self, tmp_path, monkeypatch):
+        """shots 非列表 / 含非对象元素时返回 422，且不被 reorder 空排列覆盖成 []。"""
+        fake_pm = _FakePM(tmp_path)
+        fake_pm.scripts[("ad-ready", "episode_1.json")] = {"content_mode": "ad", "shots": "oops"}
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            # 非列表 shots：reorder 传空排列也必须 422，不得把损坏数据覆盖成空列表
+            wiped = client.post(
+                "/api/v1/projects/ad-ready/script-shots/reorder",
+                json={"script_file": "episode_1.json", "shot_ids": []},
+            )
+            assert wiped.status_code == 422
+            assert fake_pm.scripts[("ad-ready", "episode_1.json")]["shots"] == "oops"
+
+            # PATCH 路径同样 422，而非误导性的 404
+            patched = client.patch(
+                "/api/v1/projects/ad-ready/script-shots/E1S01",
+                json={"script_file": "episode_1.json", "updates": {"voiceover_text": "x"}},
+            )
+            assert patched.status_code == 422
+
+            # 列表含非对象元素：同样 fail loud
+            fake_pm.scripts[("ad-ready", "episode_1.json")] = {"content_mode": "ad", "shots": [{"shot_id": "a"}, 42]}
+            mixed = client.post(
+                "/api/v1/projects/ad-ready/script-shots/reorder",
+                json={"script_file": "episode_1.json", "shot_ids": ["a"]},
+            )
+            assert mixed.status_code == 422
+
+            # shot_id 缺失或非字符串：拦下避免 PATCH 误报 404 / reorder KeyError 变 500
+            fake_pm.scripts[("ad-ready", "episode_1.json")] = {
+                "content_mode": "ad",
+                "shots": [{"shot_id": "a"}, {"section": "hook"}],
+            }
+            missing_id = client.post(
+                "/api/v1/projects/ad-ready/script-shots/reorder",
+                json={"script_file": "episode_1.json", "shot_ids": ["a"]},
+            )
+            assert missing_id.status_code == 422
+
+            fake_pm.scripts[("ad-ready", "episode_1.json")] = {
+                "content_mode": "ad",
+                "shots": [{"shot_id": 7}],
+            }
+            dirty_id = client.patch(
+                "/api/v1/projects/ad-ready/script-shots/E1S01",
+                json={"script_file": "episode_1.json", "updates": {"voiceover_text": "x"}},
+            )
+            assert dirty_id.status_code == 422
+
+            # 重复 shot_id：身份键不唯一，PATCH 会静默更新首个命中项，必须拦下
+            fake_pm.scripts[("ad-ready", "episode_1.json")] = {
+                "content_mode": "ad",
+                "shots": [{"shot_id": "a"}, {"shot_id": "a"}],
+            }
+            dup_id = client.patch(
+                "/api/v1/projects/ad-ready/script-shots/a",
+                json={"script_file": "episode_1.json", "updates": {"voiceover_text": "x"}},
+            )
+            assert dup_id.status_code == 422
+
     def test_get_project_includes_asset_fingerprints(self, tmp_path, monkeypatch):
         """项目 API 应返回 asset_fingerprints 字段"""
         fake_pm = _FakePM(tmp_path)
