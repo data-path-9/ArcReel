@@ -33,7 +33,8 @@ class AgentChatRequest(BaseModel):
 class AgentChatResponse(BaseModel):
     session_id: str
     reply: str
-    status: str  # "completed" | "timeout" | "error"
+    status: str  # "completed" | "timeout" | "error" | "interrupted"
+    truncated: bool = False  # 回复可能不完整且未能从事件日志确认补齐
 
 
 def _extract_text_from_assistant_message(msg: dict) -> str:
@@ -160,6 +161,7 @@ async def agent_chat(
     - 若传入 session_id，则在该会话上下文中继续对话
     - 内部对接 AssistantService，收集完整响应后返回
     - 超过 120 秒返回已收集的部分响应，status 为 "timeout"
+    - 流异常收尾时从事件日志补齐回复；无法确认完整的非空回复以 truncated=true 标记
     """
     service = get_assistant_service()
 
@@ -203,20 +205,43 @@ async def agent_chat(
 
     # 收集回复（带超时）
     reply, status = await _collect_reply(service, session_id, SYNC_CHAT_TIMEOUT)
+    truncated = False
 
-    # 订阅建立前回复已完成（或部分广播已错过）时，直播收集为空；
-    # 事件日志是唯一读源，从本轮用户条目之后的主线 assistant 条目兜底提取。
-    if not reply:
+    # 事件日志是唯一可靠读源，两类情形需要回读兜底：
+    # - 直播收集为空：订阅建立前回复已完成，或部分广播已错过；
+    # - 流异常收尾（error / interrupted，如订阅队列溢出）：直播回复可能非空但被截断，
+    #   不能当作完整回复放行——回读补齐，补不齐则标记截断态。
+    stream_aborted = status not in ("completed", "timeout")
+    if not reply or stream_aborted:
         try:
             user_entry = result.get("entry")
             user_seq = user_entry.get("seq", -1) if isinstance(user_entry, dict) else -1
             payload = await service.list_session_entries(session_id, after_seq=user_seq)
-            reply = _extract_reply_from_entries(payload.get("entries", []), user_seq)
+            log_reply = _extract_reply_from_entries(payload.get("entries", []), user_seq)
+            session_running = payload.get("status") == "running"
+            if not reply:
+                # 直播收集为空：按既有兜底语义采用日志内容（日志同样为空则维持空回复）；
+                # 但异常收尾且会话仍在 running 时，日志内容同样未收全，不能当作已确认完整。
+                reply = log_reply
+                truncated = stream_aborted and session_running and bool(log_reply)
+            else:
+                # 流异常收尾但直播已收到非空文本：会话运行态标志本身存在竞态——
+                # 中断/取消路径会丢弃已广播但未及落库的尾部消息，异步落库也可能滞后
+                # 于直播广播——单凭"非 running"不足以证明日志已收全本轮内容。
+                # 仅当会话已转终态、且日志文本不短于直播已收文本时才视为确认完整，
+                # 可放心整体替换；否则保留直播文本，标记截断态，避免被更短、更旧
+                # 的日志内容静默覆盖。
+                if not session_running and len(log_reply) >= len(reply):
+                    reply = log_reply
+                else:
+                    truncated = stream_aborted
         except Exception as exc:
             logger.warning("从事件日志提取回复失败 session_id=%s: %s", session_id, exc)
+            truncated = stream_aborted and bool(reply)
 
     return AgentChatResponse(
         session_id=session_id,
         reply=reply,
         status=status,
+        truncated=truncated,
     )
