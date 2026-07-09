@@ -31,7 +31,10 @@
 #     "reviews":  [{id, submittedAt, state, body}],     # body = review SUMMARY (## Code Review ...) — can contain actionable text not in inline; id = GraphQL node id
 #     "comments": [...]
 #   },
-#   "codex": {
+#   "codex": {                                          # NOT integrated in this repo (no Codex GitHub App) — the loop never
+#                                                       # triggers it and this block is unused by current pass/wait logic.
+#                                                       # Kept as raw data + reference for future re-integration — see
+#                                                       # references/reviewers.md "OpenAI Codex(未接入,不参审)" and PITFALL 4.
 #     "reviews":   [{id, submittedAt, state, body}],    # body contains "Reviewed commit: <SHA>" when present; id = GraphQL node id
 #     "comments":  [...],
 #     "reactions": [{content, created_at}]              # +1 reaction on PR = silent ack — see PITFALL 4
@@ -53,7 +56,7 @@
 #     "open_introduced": [{number, rule, severity, security_severity, tool, path, url}]  # open alerts introduced by this PR
 #   },
 #   "quota_alerts": [...],                              # PR-level issue comments matching quota keywords (bots emit quota errors as plain comments, not reviews)
-#   "own_trigger_comments": [...]                       # human-authored /gemini review / @codex review / @coderabbitai resume
+#   "own_trigger_comments": [...]                       # human-authored /gemini review / @coderabbitai resume
 # }
 #
 # PITFALLS
@@ -71,7 +74,8 @@
 #    REST    `user.login`   = "coderabbitai[bot]" (with [bot] suffix).
 #    This script uses both endpoints; downstream consumers must use the right form for each datum.
 #
-# 4. Codex acks PR in 3 modes — all must be checked (see references/reviewers.md for full table):
+# 4. Codex is NOT integrated in this repo — the loop never triggers or waits on it. The 3 ack modes
+#    below only apply if/when the Codex GitHub App is later connected (see references/reviewers.md):
 #    (a) inline review with body "### 💡 Codex Review" + "Reviewed commit: <SHA>"
 #    (b) PR-level +1 reaction with NO comment (silent pass)
 #    (c) empty-body review (state=COMMENTED, body="") with no new inline
@@ -87,7 +91,9 @@
 #
 # 6. Quota / rate-limit errors from Codex are PR-level ISSUE comments, NOT reviews/inline/reactions.
 #    Codex emits e.g. "You have reached your Codex usage limits..." as a plain PR comment — easy to miss.
-#    Captured into quota_alerts so the skill catches it on the first poll.
+#    Captured into quota_alerts so the skill catches it on the first poll. Codex is NOT integrated
+#    in this repo and the loop never triggers it, but quota_alerts still watches for this pattern
+#    in case a human manually triggers `@codex review` outside the loop.
 #
 # 7. security_alerts.open_introduced subtracts default-branch open alerts by alert number.
 #    The merge-ref analysis covers the whole codebase, so pre-existing alerts (e.g. scheduled
@@ -153,7 +159,8 @@ gh api "repos/${OWNER_REPO}/issues/${PR}/comments" --paginate > "$TMPDIR/sub_a.j
   exit 5
 }
 
-# Sub-query B — PR-level reactions (Codex silent +1 ack path).
+# Sub-query B — PR-level reactions (Codex silent +1 ack path; Codex is NOT integrated in
+# this repo, see PITFALL 4 — kept as raw data for future re-integration reference).
 gh api "repos/${OWNER_REPO}/issues/${PR}/reactions" --paginate > "$TMPDIR/sub_b.json" 2>"$TMPDIR/gh_reactions.err" || {
   echo "POLL_ERROR: REST reactions fetch failed" >&2
   cat "$TMPDIR/gh_reactions.err" >&2
@@ -235,7 +242,9 @@ jq -n \
       end;
 
   def is_ack_body:
-    (test("<!--\\s*<review_comment_addressed>")) or (test("^### Summary"));
+    (test("<!--\\s*<review_comment_addressed>"))
+    or (test("<!--\\s*<review_comment_withdrawn>"))
+    or (test("^### Summary"));
 
   def inline_by_bot:
     [$sub_c[] | select(.user.login | test("(coderabbitai|gemini-code-assist|chatgpt-codex-connector|github-code-quality|github-advanced-security)\\[bot\\]$"))]
@@ -337,8 +346,12 @@ jq -n \
        | select(
            (.author.login != "coderabbitai"
             and .author.login != "gemini-code-assist"
+            # chatgpt-codex-connector: defensive exclusion, kept even though the trigger regex
+            # below no longer matches "@codex review" — harmless as long as this bot never posts
+            # comments matching the pattern, and cheap insurance against future regex changes
+            # that widen it again.
             and .author.login != "chatgpt-codex-connector")
-           and (.body | test("^[ \\t]*(/gemini review|@codex review|@coderabbitai resume)(\\s|$)"; "i"))
+           and (.body | test("^[ \\t]*(/gemini review|@coderabbitai resume)(\\s|$)"; "i"))
          )
        | {author: .author.login, createdAt, body: (.body | gsub("^\\s+|\\s+$"; ""))}]
   }
