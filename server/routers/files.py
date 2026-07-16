@@ -18,6 +18,7 @@ from fastapi import APIRouter, Body, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from lib.asset_types import GLOBAL_LIBRARY_ASSET_TYPES
+from lib.config.resolver import VisionCapabilityError
 from lib.episode_paths import (
     REFERENCE_VIDEO_STEP1_FILENAME,
     REFERENCE_VIDEO_STEP1_LEGACY_FILENAME,
@@ -954,6 +955,11 @@ async def upload_style_image(project_name: str, _user: CurrentUser, _t: Translat
         raise HTTPException(status_code=404, detail=_t("project_not_found", name=project_name))
     except HTTPException:
         raise
+    except VisionCapabilityError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=_t("vision_model_required", provider=e.provider_id, model=e.model_id, task=e.task_type.value),
+        )
     except Exception:
         logger.exception("请求处理失败")
         raise HTTPException(status_code=500, detail=_t("internal_server_error"))

@@ -73,6 +73,7 @@ MESSAGES = {
     "unsupported_video_type": "Unsupported video type {ext}. Allowed types: {allowed}",
     "upload_too_large": "Uploaded file exceeds the size limit ({max_mb} MB)",
     "invalid_image_file": "Invalid image file, could not be parsed",
+    "vision_model_required": "Text model {provider}/{model} does not support image input (vision) and cannot perform the {task} task; please select a vision-capable text model for the simple tier or default model in settings",
     "internal_server_error": "Internal server error, please try again later",
     "invalid_asset_type": "asset type must be character / scene / prop",
     "invalid_asset_filename": "filename must not contain path separators or ..",
@@ -163,6 +164,7 @@ MESSAGES = {
     "cost_estimation_failed": "Cost estimation failed, please try again later",
     # Validators
     "invalid_backend_format": "{field_name} format should be provider/model",
+    "backend_media_type_mismatch": "{field_name} expects a {expected} model, but {provider}/{model} is a {actual} model",
     "deprecated_image_backend": "The image_backend field is deprecated; use image_provider_t2i and image_provider_i2i instead",
     # Versions
     "unsupported_resource_type": "Unsupported resource type: {resource_type}",

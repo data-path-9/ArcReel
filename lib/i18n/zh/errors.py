@@ -73,6 +73,7 @@ MESSAGES = {
     "unsupported_video_type": "不支持的视频类型 {ext}，允许的类型: {allowed}",
     "upload_too_large": "上传文件超过大小上限（{max_mb} MB）",
     "invalid_image_file": "无效的图片文件，无法解析",
+    "vision_model_required": "文本模型 {provider}/{model} 不支持图像输入（vision），无法执行 {task} 任务；请在设置中为简单档或默认模型选择支持 vision 的文本模型",
     "internal_server_error": "服务器内部错误，请稍后重试",
     "invalid_asset_type": "资产类型必须为 character / scene / prop",
     "invalid_asset_filename": "文件名不能包含路径分隔符或 ..",
@@ -160,6 +161,7 @@ MESSAGES = {
     "cost_estimation_failed": "费用估算失败，请稍后重试",
     # Validators
     "invalid_backend_format": "{field_name} 格式应为 provider/model",
+    "backend_media_type_mismatch": "{field_name} 期望 {expected} 类型模型，但 {provider}/{model} 是 {actual} 类型",
     "deprecated_image_backend": "image_backend 字段已废弃，请改用 image_provider_t2i 与 image_provider_i2i",
     # Versions
     "unsupported_resource_type": "不支持的资源类型: {resource_type}",
